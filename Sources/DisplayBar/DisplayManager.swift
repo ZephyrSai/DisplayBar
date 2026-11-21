@@ -3,6 +3,11 @@ import CDisplayPrivate
 import ColorSync
 import CoreGraphics
 import IOKit
+import os
+
+/// Decisions about off records, sleep/wake and the rescue, so a lost screen can be traced:
+/// `log show --predicate 'subsystem == "DisplayBar"' --last 1h`
+let displayLog = Logger(subsystem: "DisplayBar", category: "displays")
 
 extension Notification.Name {
     /// The set of displays or their configuration changed.
@@ -95,12 +100,27 @@ final class DisplayManager {
     private var started = false
     private var refreshScheduled = false
     private var sleeping = false
+    /// Uptime of the last wake. Displays come and go for a few seconds after waking (and
+    /// macOS may list a disabled panel while nothing else is connected), so off records are
+    /// neither dropped nor adopted until `wakeSettle` has passed.
+    private var wokeAt: TimeInterval = -.infinity
+    private static let wakeSettle: TimeInterval = 8
     private var rescuePending = false
+    /// Rescues since a usable screen was last seen; caps the retries if macOS ignores them.
+    private var rescueAttempts = 0
+    private static let maxRescueAttempts = 5
+    /// When the built-in panel was first seen missing with the lid open and no off record.
+    private var builtinMissingSince: TimeInterval?
     /// When each display was turned off. macOS disables the displays of one transaction one
     /// after another, so a refresh in between still sees some of them online; records younger
     /// than `offGrace` are never treated as "turned back on elsewhere".
     private var offAt: [CGDirectDisplayID: TimeInterval] = [:]
     private static let offGrace: TimeInterval = 6
+    private var lastLoggedState = ""
+
+    private var settling: Bool {
+        sleeping || ProcessInfo.processInfo.systemUptime - wokeAt < Self.wakeSettle
+    }
 
     // MARK: Lifecycle
 
@@ -118,16 +138,32 @@ final class DisplayManager {
 
         let center = NSWorkspace.shared.notificationCenter
         center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { _ in
+            displayLog.notice("will sleep; off: \(DisplayManager.shared.off.map(\.id), privacy: .public)")
             DisplayManager.shared.sleeping = true
         }
         center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { _ in
-            DisplayManager.shared.sleeping = false
-            DisplayManager.shared.scheduleRefresh(after: 2)
+            DisplayManager.shared.didWake()
+        }
+        // Belt and braces: if the system wake notification is missed, the screens waking still ends "sleeping".
+        center.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main) { _ in
+            if DisplayManager.shared.sleeping { DisplayManager.shared.didWake() }
         }
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { _ in
             DisplayManager.shared.scheduleRefresh()
         }
         refresh()
+        // Covers a launch while the built-in panel is already disabled and unrecorded.
+        DispatchQueue.main.asyncAfter(deadline: .now() + Safety.adoptDelay + 0.5) { self.scheduleRefresh() }
+    }
+
+    private func didWake() {
+        sleeping = false
+        wokeAt = ProcessInfo.processInfo.systemUptime
+        displayLog.notice("did wake; online: \(Self.onlineIDs(), privacy: .public) visible: \(Self.visibleIDs(), privacy: .public) off: \(self.off.map(\.id), privacy: .public) lid closed: \(Self.lidClosed(), privacy: .public)")
+        scheduleRefresh(after: 2)
+        // Once the wake has settled, look again: records may be dropped/adopted and the lid may read open by now.
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.wakeSettle + 0.5) { self.scheduleRefresh() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.wakeSettle + Safety.adoptDelay + 1) { self.scheduleRefresh() }
     }
 
     /// Restores everything DisplayBar changed (used on quit when the preference is on).
@@ -167,14 +203,31 @@ final class DisplayManager {
         ddcAsleep = ddcAsleep.filter(ids.contains)
 
         let now = ProcessInfo.processInfo.systemUptime
-        let young = off.filter { ids.contains($0.id) && now - (offAt[$0.id] ?? 0) < Self.offGrace }
-        let stillOff = off.filter { !ids.contains($0.id) || young.contains($0) }
-        if !young.isEmpty { scheduleRefresh(after: Self.offGrace) }
+        let visible = Self.visibleIDs()
+        let settling = self.settling
+        let offIDs = Set(off.map(\.id))
+        var stillOff: [OffDisplay] = []
+        var recheck = false
+        for record in off {
+            let isVisible = visible.contains(record.id)
+            let young = now - (offAt[record.id] ?? 0) < Self.offGrace
+            let others = Safety.usablePhysical(visible: visible.filter { $0 != record.id }, virtual: virtualIDs, off: offIDs)
+            if Safety.shouldForget(visible: isVisible, othersUsable: others, settling: settling, young: young) {
+                displayLog.notice("\(record.id, privacy: .public) is back on next to another screen; dropping its off record")
+            } else {
+                stillOff.append(record)
+                if isVisible && (young || settling) { recheck = true }
+            }
+        }
+        if recheck { scheduleRefresh(after: Self.offGrace) }
         offAt = offAt.filter { id, _ in stillOff.contains { $0.id == id } }
         if stillOff != off {
             off = stillOff
             Prefs.offDisplays = off
         }
+        adoptLostBuiltin(online: ids, now: now, settling: settling)
+        if Safety.usablePhysical(visible: visible, virtual: virtualIDs, off: Set(off.map(\.id))) > 0 { rescueAttempts = 0 }
+        logState(online: ids, visible: visible)
 
         var known = Prefs.knownDisplays
         for d in displays where !d.isVirtual && known[d.uuid] != d.name { known[d.uuid] = d.name }
@@ -185,6 +238,47 @@ final class DisplayManager {
         if probe { for d in displays where !d.probed { self.probe(d) } }
         checkRescue()
         NotificationCenter.default.post(name: .displaysChanged, object: nil)
+    }
+
+    /// Lists the built-in panel as off again when it is missing with the lid open and nothing
+    /// records it (the record was lost, or another app disabled it), so it can't stay stranded.
+    private func adoptLostBuiltin(online: [CGDirectDisplayID], now: TimeInterval, settling: Bool) {
+        let missing = Self.offlineBuiltinID(online: online)
+        let recorded = off.contains { $0.isBuiltin || $0.id == missing }
+        guard let id = missing, !recorded, !settling, !Self.lidClosed() else {
+            builtinMissingSince = nil
+            return
+        }
+        let since = builtinMissingSince ?? now
+        builtinMissingSince = since
+        guard Safety.shouldAdoptBuiltin(offline: true, recorded: false, lidClosed: false, settling: false, missingFor: now - since) else {
+            // Look again once it has been missing long enough; a lid that just opened needs a moment.
+            DispatchQueue.main.asyncAfter(deadline: .now() + Safety.adoptDelay - (now - since) + 0.2) { self.scheduleRefresh() }
+            return
+        }
+        builtinMissingSince = nil
+        let uuid = Self.uuid(id)
+        let name = Prefs.customNames[uuid] ?? Prefs.knownDisplays[uuid] ?? "Built-in Display"
+        displayLog.notice("built-in \(id, privacy: .public) is disabled with the lid open and wasn't recorded; listing it as off")
+        off.append(OffDisplay(id: id, uuid: uuid, name: name, isBuiltin: true, isVirtual: false))
+        Prefs.offDisplays = off.filter { !$0.isVirtual }
+    }
+
+    /// The built-in panel's ID when it exists but isn't online. macOS keeps answering for a
+    /// disabled display's ID (built-in flag, UUID), it just leaves it out of the online list.
+    static func offlineBuiltinID(online: [CGDirectDisplayID]) -> CGDirectDisplayID? {
+        if online.contains(where: { CGDisplayIsBuiltin($0) != 0 }) { return nil }
+        for id in CGDirectDisplayID(1)...16 where CGDisplayIsBuiltin(id) != 0 && CGDisplayCreateUUIDFromDisplayID(id) != nil {
+            return id
+        }
+        return nil
+    }
+
+    private func logState(online: [CGDirectDisplayID], visible: [CGDirectDisplayID]) {
+        let state = "online \(online) visible \(visible) off \(off.map(\.id)) sleeping \(sleeping) settling \(settling)"
+        guard state != lastLoggedState else { return }
+        lastLoggedState = state
+        displayLog.notice("\(state, privacy: .public)")
     }
 
     private func makeDisplay(_ id: CGDirectDisplayID) -> Display {
@@ -328,14 +422,19 @@ final class DisplayManager {
         return true
     }
 
-    func turnOn(_ ids: [CGDirectDisplayID], feedback: Bool = false) {
+    /// `keepOnFailure`: if macOS refuses, keep every record so the next attempt can retry
+    /// (the rescue). Otherwise only the built-in's record survives a refusal; an external's
+    /// is dropped since it may simply have been unplugged meanwhile.
+    func turnOn(_ ids: [CGDirectDisplayID], feedback: Bool = false, keepOnFailure: Bool = false) {
         guard !ids.isEmpty else { return }
         let names = ids.map { name(of: $0) }
         let ok = Self.configure(ids, enabled: true)
-        // Whether or not the display reappears (it may have been unplugged meanwhile),
-        // macOS now considers it enabled, so the record has done its job.
-        off.removeAll { ids.contains($0.id) }
-        for id in ids { offAt[id] = nil }
+        displayLog.notice("turn on \(ids, privacy: .public): \(ok ? "ok" : "refused", privacy: .public)")
+        // Once macOS accepts, it considers the display enabled (even if it was unplugged
+        // meanwhile), so the record has done its job.
+        let done = ids.filter { id in ok || !(keepOnFailure || off.contains { $0.id == id && $0.isBuiltin }) }
+        off.removeAll { done.contains($0.id) }
+        for id in done { offAt[id] = nil }
         Prefs.offDisplays = off.filter { !$0.isVirtual }
         if feedback {
             HUD.shared.show(symbol: ok ? "power" : "exclamationmark.triangle.fill",
@@ -381,26 +480,44 @@ final class DisplayManager {
         }
     }
 
-    /// Test hook: replaces the live readings (visible physical screens, lid state).
+    /// Test hook: replaces the live readings (usable physical screens, lid state).
     var rescueOverride: (() -> (physical: Int, lidClosed: Bool))?
+
+    /// Test hooks: inject off records (in memory and in the self-test's own defaults) and
+    /// pretend the last wake was `secondsAgo` seconds ago.
+    func testReplaceOff(_ records: [OffDisplay]) {
+        off = records
+        offAt = [:]
+        Prefs.offDisplays = off
+    }
+
+    func testSetWoke(secondsAgo: TimeInterval) {
+        sleeping = false
+        wokeAt = ProcessInfo.processInfo.systemUptime - secondsAgo
+    }
 
     private func rescueState() -> (physical: Int, lidClosed: Bool) {
         if let rescueOverride { return rescueOverride() }
-        return (Self.visibleIDs().filter { !virtualIDs.contains($0) }.count, Self.lidClosed())
+        let physical = Safety.usablePhysical(visible: Self.visibleIDs(), virtual: virtualIDs, off: Set(off.map(\.id)))
+        return (physical, Self.lidClosed())
     }
 
     func checkRescue() {
         guard !off.isEmpty, !rescuePending else { return }
         let state = rescueState()
         guard Safety.shouldRescue(visiblePhysical: state.physical, offCount: off.count, lidClosed: state.lidClosed, sleeping: sleeping) else { return }
+        guard rescueAttempts < Self.maxRescueAttempts else { return }
         // Re-check after a moment so a transient state during reconfiguration doesn't trigger it.
         rescuePending = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
             self.rescuePending = false
             let state = self.rescueState()
             if Safety.shouldRescue(visiblePhysical: state.physical, offCount: self.off.count, lidClosed: state.lidClosed, sleeping: self.sleeping) {
-                NSLog("DisplayBar: no screen left, turning displays back on")
-                self.turnOn(self.off.map(\.id))
+                self.rescueAttempts += 1
+                displayLog.notice("no usable screen left (attempt \(self.rescueAttempts, privacy: .public)); turning \(self.off.map(\.id), privacy: .public) back on")
+                self.turnOn(self.off.map(\.id), keepOnFailure: true)
+                // Check it worked: a refused attempt kept its records, a panel that stayed dark is adopted again.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 4) { self.scheduleRefresh() }
             }
         }
     }

@@ -27,6 +27,7 @@ enum SelfTest {
         logic()
         arrangementMath()
         shortcuts()
+        offRecords()
         // --no-displays: skip everything that adds/removes/reconfigures displays
         // (each reconfiguration makes macOS redraw the menu bar).
         if !CommandLine.arguments.contains("--no-displays") {
@@ -51,7 +52,59 @@ enum SelfTest {
         check(!Safety.shouldRescue(visiblePhysical: 0, offCount: 1, lidClosed: false, sleeping: true), "no rescue while sleeping")
         check(!Safety.shouldRescue(visiblePhysical: 1, offCount: 1, lidClosed: false, sleeping: false), "no rescue while a screen is visible")
         check(!Safety.shouldRescue(visiblePhysical: 0, offCount: 0, lidClosed: false, sleeping: false), "no rescue when nothing is off")
+        check(Safety.usablePhysical(visible: [1], virtual: [], off: [1]) == 0, "a display we turned off doesn't count as usable even when macOS lists it")
+        check(Safety.usablePhysical(visible: [1, 2, 9], virtual: [9], off: [1]) == 1, "usable screens skip virtual and turned-off displays")
+        check(Safety.shouldForget(visible: true, othersUsable: 1, settling: false, young: false), "a record is dropped once its display is back on next to another screen")
+        check(!Safety.shouldForget(visible: true, othersUsable: 0, settling: false, young: false), "a record stays while its display is the only thing listed (the rescue turns it on)")
+        check(!Safety.shouldForget(visible: true, othersUsable: 1, settling: true, young: false), "a record stays during sleep and right after wake")
+        check(!Safety.shouldForget(visible: true, othersUsable: 1, settling: false, young: true), "a young record stays while macOS is still turning displays off")
+        check(!Safety.shouldForget(visible: false, othersUsable: 1, settling: false, young: false), "a record stays while its display is gone")
+        check(Safety.shouldAdoptBuiltin(offline: true, recorded: false, lidClosed: false, settling: false, missingFor: 5), "an unrecorded, disabled built-in with the lid open is listed as off again")
+        check(!Safety.shouldAdoptBuiltin(offline: true, recorded: false, lidClosed: true, settling: false, missingFor: 5), "not with the lid closed (clamshell)")
+        check(!Safety.shouldAdoptBuiltin(offline: true, recorded: false, lidClosed: false, settling: true, missingFor: 5), "not while waking up")
+        check(!Safety.shouldAdoptBuiltin(offline: true, recorded: false, lidClosed: false, settling: false, missingFor: 1), "not in the moment after the lid opens")
+        check(!Safety.shouldAdoptBuiltin(offline: true, recorded: true, lidClosed: false, settling: false, missingFor: 5), "not when it's already listed as off")
         check(DisplayManager.eisaCode(19083) == "RTK", "EDID vendor 19083 decodes to RTK")
+    }
+
+    /// Off records against the real display list, without changing any display: records are
+    /// injected for displays that are on, and the rescue is held back.
+    private static func offRecords() {
+        print("— off records (no display changes)")
+        let manager = DisplayManager.shared
+        manager.refresh(probe: false)
+        manager.rescueOverride = { (1, false) }
+        defer {
+            manager.testReplaceOff([])
+            manager.testSetWoke(secondsAgo: 1000)
+            manager.rescueOverride = nil
+            manager.refresh(probe: false)
+        }
+        func record(_ d: Display) -> OffDisplay {
+            OffDisplay(id: d.id, uuid: d.uuid, name: d.name, isBuiltin: d.isBuiltin, isVirtual: false)
+        }
+        manager.testSetWoke(secondsAgo: 1000)
+        let phantom = OffDisplay(id: 0x7EAD_0001, uuid: "selftest-phantom", name: "Phantom", isBuiltin: false, isVirtual: false)
+        manager.testReplaceOff([phantom])
+        manager.refresh(probe: false)
+        check(manager.off == [phantom], "a display that's gone keeps its off record")
+
+        let physical = manager.displays.filter { !$0.isVirtual && DisplayManager.visibleIDs().contains($0.id) }
+        check(DisplayManager.offlineBuiltinID(online: DisplayManager.onlineIDs()) == nil || !physical.contains(where: \.isBuiltin), "the built-in isn't reported missing while it's on")
+        guard let first = physical.first else { return check(false, "a visible physical display to test with") }
+
+        manager.testReplaceOff(physical.map(record))
+        manager.refresh(probe: false)
+        check(manager.off.count == physical.count, "displays that are the only thing listed keep their records (the woke-without-a-screen case)")
+
+        guard physical.count >= 2 else { return print("SKIP two-screen checks: only one physical display") }
+        manager.testReplaceOff([record(first)])
+        manager.testSetWoke(secondsAgo: 1)
+        manager.refresh(probe: false)
+        check(manager.off.count == 1, "right after wake, a listed display keeps its record")
+        manager.testSetWoke(secondsAgo: 1000)
+        manager.refresh(probe: false)
+        check(manager.off.isEmpty, "once settled, a record is dropped when its display is on next to another screen")
     }
 
     private static func arrangementMath() {
